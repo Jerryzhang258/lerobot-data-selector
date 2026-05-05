@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """
-Apply DataSelector selection.json to a LeRobot dataset.
+Apply DataSelector selection.json to a LeRobot v2 dataset.
 
 This script creates a filtered copy of the dataset by dropping episodes
 listed in selection.json["deleted"]["episodes"], then reindexes episodes
 and frame indices to keep metadata consistent.
+
+Layout: ``data/chunk-*/episode_*.parquet`` only (LeRobot v2.x).
 """
 
 from __future__ import annotations
@@ -14,7 +16,6 @@ import json
 import shutil
 from pathlib import Path
 
-import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 
@@ -44,36 +45,54 @@ def save_jsonl(path: Path, rows: list[dict]):
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
-def collect_episode_frames(dataset_dir: Path) -> dict[int, pd.DataFrame]:
-    """
-    Return {episode_index: dataframe} for both LeRobot v2 and v3 layouts.
-    """
-    episodes: dict[int, pd.DataFrame] = {}
+def _table_with_reindexed_episode(table: pa.Table, new_ep: int, frame_start: int) -> pa.Table:
+    """Update episode_index / index in-place on column types; keeps Arrow schema (e.g. image types)."""
+    out = table
+    n = table.num_rows
+    if "episode_index" in table.column_names:
+        field = table.schema.field("episode_index")
+        out = out.set_column(
+            out.schema.get_field_index("episode_index"),
+            "episode_index",
+            pa.array([new_ep] * n, type=field.type),
+        )
+    if "index" in out.column_names:
+        field = out.schema.field("index")
+        out = out.set_column(
+            out.schema.get_field_index("index"),
+            "index",
+            pa.array(range(frame_start, frame_start + n), type=field.type),
+        )
+    return out
 
-    # v2: one episode parquet per file
+
+def collect_episode_frames(dataset_dir: Path) -> dict[int, pa.Table]:
+    """
+    LeRobot v2 only: ``data/chunk-*/episode_*.parquet`` (one parquet per episode).
+
+    PyArrow read/write keeps Arrow schema (e.g. image columns) intact; pandas round-trip does not.
+    """
+    episodes: dict[int, pa.Table] = {}
+
     v2_files = sorted(dataset_dir.glob("data/chunk-*/episode_*.parquet"))
-    if v2_files:
-        for p in v2_files:
-            df = pd.read_parquet(p)
-            if "episode_index" in df.columns and not df.empty:
-                old_ep = int(df["episode_index"].iloc[0])
-            else:
-                old_ep = int(p.stem.split("_")[-1])
-                df["episode_index"] = old_ep
-            episodes[old_ep] = df.reset_index(drop=True)
-        return episodes
+    if not v2_files:
+        raise FileNotFoundError(
+            "No LeRobot v2 episode parquet files found under data/chunk-*/episode_*.parquet. "
+            "This script only supports v2 layout (one file per episode)."
+        )
 
-    # v3: one file contains multiple episodes grouped by episode_index
-    v3_files = sorted(dataset_dir.glob("data/chunk-*/file-*.parquet"))
-    if not v3_files:
-        v3_files = sorted(dataset_dir.glob("data/*.parquet"))
-
-    for p in v3_files:
-        df = pd.read_parquet(p)
-        if "episode_index" not in df.columns or df.empty:
-            continue
-        for old_ep, grp in df.groupby("episode_index", sort=False):
-            episodes[int(old_ep)] = grp.reset_index(drop=True)
+    for p in v2_files:
+        table = pq.read_table(p)
+        if "episode_index" in table.column_names and table.num_rows > 0:
+            old_ep = int(table["episode_index"][0].as_py())
+        else:
+            old_ep = int(p.stem.split("_")[-1])
+            if "episode_index" not in table.column_names:
+                table = table.append_column(
+                    "episode_index",
+                    pa.array([old_ep] * table.num_rows, type=pa.int64()),
+                )
+        episodes[old_ep] = table
 
     return episodes
 
@@ -103,13 +122,8 @@ def rebuild_dataset(src_dir: Path, out_dir: Path, deleted_eps: set[int], dry_run
 
     for old_ep in keep_old_eps:
         new_ep = old_to_new[old_ep]
-        df = frames_by_ep[old_ep].copy()
-        ep_len = len(df)
-
-        if "episode_index" in df.columns:
-            df["episode_index"] = new_ep
-        if "index" in df.columns:
-            df["index"] = range(frame_offset, frame_offset + ep_len)
+        tbl = frames_by_ep[old_ep]
+        ep_len = tbl.num_rows
 
         # Prefer original episode metadata when available.
         old_meta = next((x for x in episodes_meta if int(x["episode_index"]) == old_ep), None)
@@ -187,16 +201,13 @@ def rebuild_dataset(src_dir: Path, out_dir: Path, deleted_eps: set[int], dry_run
     frame_offset = 0
     for old_ep in keep_old_eps:
         new_ep = old_to_new[old_ep]
-        df = frames_by_ep[old_ep].copy()
-        ep_len = len(df)
-        if "episode_index" in df.columns:
-            df["episode_index"] = new_ep
-        if "index" in df.columns:
-            df["index"] = range(frame_offset, frame_offset + ep_len)
+        tbl = frames_by_ep[old_ep]
+        ep_len = tbl.num_rows
+        new_tbl = _table_with_reindexed_episode(tbl, new_ep, frame_offset)
         chunk = new_ep // 1000
         out_file = out_dir / "data" / f"chunk-{chunk:03d}" / f"episode_{new_ep:06d}.parquet"
         out_file.parent.mkdir(parents=True, exist_ok=True)
-        pq.write_table(pa.Table.from_pandas(df, preserve_index=False), out_file, compression="snappy")
+        pq.write_table(new_tbl, out_file, compression="snappy")
         frame_offset += ep_len
 
     print("[DONE] Filtered dataset written successfully.")
@@ -218,3 +229,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
